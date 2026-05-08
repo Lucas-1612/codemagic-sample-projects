@@ -334,37 +334,83 @@ workflows:
         
         submit_to_testflight: false # Boolean use to indicate if you want to submit to TestFlight review so external testers can test your app
   
-  flutter-android:
-    name: Flutter Android 
+  flutter-macOS-workflow:
+    name: Flutter macOS Workflow
     instance_type: mac_mini_m2
-    max_build_duration: 120
-    working_directory: flutter/flutter-android-and-ios-yaml-demo-project
+    max_build_duration: 60
+    working_directory: flutter/flutter-macos-demo-project
+    integrations:
+          app_store_connect: codemagic_samples2 # <-- (Includes APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY)
     environment:
-      android_signing:
-        - codemagic_keystore
-      groups:
-        - google_play # <-- (Includes GOOGLE_PLAY_SERVICE_ACCOUNT_CREDENTIALS)
-      vars:
-        PACKAGE_NAME: "io.codemagic.flutter" # <-- Put your package name here
-        GOOGLE_PLAY_TRACK: "internal"
       flutter: stable
+      xcode: latest # <-- set to specific version e.g. 14.3, 15.0 to avoid unexpected updates.
+      cocoapods: default
+      groups:
+            - appstore_credentials # <-- (Includes CERTIFICATE_PRIVATE_KEY needed for automatic code-signing)
+      vars:
+           BUNDLE_ID: "io.codemagic.macosDesktop"
     scripts:
-      - name: Set up local.properties
+      - name: Set up keychain to be used for codesigning using Codemagic CLI 'keychain' command
         script: |
-          echo "flutter.sdk=$HOME/programs/flutter" > "$CM_BUILD_DIR/android/local.properties"
+          keychain initialize
+      - name: Fetch Mac App Distribution certificate and Mac App Store profile
+        script: |
+          app-store-connect fetch-signing-files \
+            $BUNDLE_ID \
+            --platform MAC_OS \
+            --type MAC_APP_STORE \
+            --create
+      - name: Fetch Mac Installer Distribution certificates
+        script: |
+          # HINT: We can use MAC_APP_DISTRIBUTION if looking to package the artifact before submitting it to App Store. 
+          # And please note that the certificate type must match the one we are using in the Package macOS application script down below.
+          app-store-connect certificates list --type MAC_INSTALLER_DISTRIBUTION --save || \
+          app-store-connect certificates create --type MAC_INSTALLER_DISTRIBUTION --save          
+      - name: Set up signing certificate
+        script: |
+          keychain add-certificates
+      - name: Set up code signing settings on Xcode project
+        script: |
+          xcode-project use-profiles
       - name: Get Flutter packages
         script: |
           flutter packages pub get
-      - name: Build AAB with Flutter
+      - name: Install pods
         script: |
-            LATEST_BUILD_NUMBER=$(($(google-play get-latest-build-number --package-name "$PACKAGE_NAME" --tracks="$GOOGLE_PLAY_TRACK")))      
-            flutter build appbundle --release \
-              --build-name=1.0.$LATEST_BUILD_NUMBER \
-              --build-number=$LATEST_BUILD_NUMBER
+          find . -name "Podfile" -execdir pod install \;
+      - name: Build Flutter macOS
+        script: |
+          flutter config --enable-macos-desktop && \
+          flutter build macos --release \
+            --build-name=1.0.$PROJECT_BUILD_NUMBER \
+            --build-number=$PROJECT_BUILD_NUMBER
+      - name: Package macOS application
+        script: |
+          set -x
+
+          # Command to find the path to your generated app
+          APP_NAME=$(find $(pwd) -name "*.app")
+          cd $(dirname "$APP_NAME")
+          PACKAGE_NAME=$(basename "$APP_NAME" .app).pkg
+
+          # Create an unsigned package
+          xcrun productbuild --component "$APP_NAME" /Applications/ unsigned.pkg
+
+          # Find the installer certificate commmon name in keychain
+          INSTALLER_CERT_NAME=$(keychain list-certificates \
+            | jq '.[]
+            | select(.common_name
+            | contains("Mac Developer Installer"))
+            | .common_name' \
+            | xargs)
+
+          # Sign the package
+          xcrun productsign --sign "$INSTALLER_CERT_NAME" unsigned.pkg "$PACKAGE_NAME"
+
+          # Remove unsigned package
+          rm unsigned.pkg
     artifacts:
-      - build/**/outputs/**/*.aab
-      - build/**/outputs/**/mapping.txt
-      - flutter_drive.log
+      - build/macos/**/*.pkg
     publishing:
       email:
         recipients:
@@ -373,12 +419,19 @@ workflows:
         notify:
           success: true
           failure: false
-      google_play:
-        credentials: $GOOGLE_PLAY_SERVICE_ACCOUNT_CREDENTIALS
-        track: $GOOGLE_PLAY_TRACK
-        submit_as_draft: true
-  
-  
+      app_store_connect:
+          auth: integration
+
+          # Configuration related to TestFlight (optional)
+          # Note: This action is performed during post-processing.
+          submit_to_testflight: true
+          beta_groups: # Specify the names of beta tester groups that will get access to the build once it has passed beta review.
+            - group name 1
+            - group name 2
+
+          # Configuration related to App Store (optional)
+          # Note: This action is performed during post-processing.
+          submit_to_app_store: false
   
   flutter-flavors-ios-dev:
     name: iOS Flutter Flavors Dev
